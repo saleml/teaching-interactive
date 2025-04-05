@@ -271,11 +271,12 @@ def simulate_mdp_trajectory(mdp, policy_func, start_state_name, n_steps):
     """Simulate a single trajectory in the MDP given a policy."""
     if start_state_name not in mdp.state_to_idx:
         st.error(f"Invalid start state: {start_state_name}")
-        return None, None
+        return None, None, None, None
 
     start_state_idx = mdp.state_to_idx[start_state_name]
     trajectory_states = [start_state_idx]
     trajectory_rewards = [0]  # Reward received *before* this state (or 0 for start)
+    trajectory_actions = []  # Store actions taken
     total_reward = 0
     current_state_idx = start_state_idx
     P = mdp.get_transitions()
@@ -284,10 +285,13 @@ def simulate_mdp_trajectory(mdp, policy_func, start_state_name, n_steps):
     for _ in range(n_steps):
         # Get action from policy
         action_idx = policy_func(current_state_idx, mdp)
+        trajectory_actions.append(action_idx)  # Record action
 
         # Get reward for taking action a in state s
+        # Note: This is R(s,a) - the immediate reward for taking action 'action_idx' in state 'current_state_idx'
+        # It's received *before* transitioning to the next state.
         reward = R[action_idx, current_state_idx]
-        total_reward += reward  # Using R(s,a) - immediate reward
+        total_reward += reward
 
         # Get next state probabilities
         next_state_probs = P[action_idx, current_state_idx, :]
@@ -301,14 +305,19 @@ def simulate_mdp_trajectory(mdp, policy_func, start_state_name, n_steps):
             st.warning(
                 f"No transitions defined for state {mdp.idx_to_state[current_state_idx]}, action {mdp.actions[action_idx]}. Staying put."
             )
+            # If staying put, conceptually no action is 'completed', but we keep the recorded action
+            # and the loop continues. Reward for the 'attempted' action was already added.
 
         trajectory_states.append(next_state_idx)
-        trajectory_rewards.append(
-            reward
-        )  # Store reward received *before* reaching next state
+        # Store the reward that resulted from the action taken in the *previous* state
+        trajectory_rewards.append(reward)
         current_state_idx = next_state_idx
 
-    return trajectory_states, trajectory_rewards, total_reward
+    # Return actions as well
+    # len(states) = n_steps + 1
+    # len(actions) = n_steps
+    # len(rewards) = n_steps + 1 (includes initial 0)
+    return trajectory_states, trajectory_actions, trajectory_rewards, total_reward
 
 
 # --- Function to calculate Induced Markov Chain ---
@@ -346,6 +355,184 @@ def calculate_induced_markov_chain(mdp, policy_func):
     return P_pi
 
 
+# --- Function for User's Proposed Monte Carlo Method ---
+def monte_carlo_specific_start_evaluation(
+    mdp, policy_func, gamma, num_episodes_per, max_steps
+):
+    """Estimates V_pi(s) and Q_pi(s,a) by running dedicated episodes for each start.
+
+    Args:
+        mdp: The RichFamousMDP instance.
+        policy_func: The policy function to evaluate.
+        gamma: Discount factor.
+        num_episodes_per: Number of simulation episodes per start state/action (N).
+        max_steps: Max steps per episode (T).
+
+    Returns:
+        V: Dictionary mapping state_name -> estimated value V(s).
+        Q: Dictionary mapping (state_name, action_name) -> estimated value Q(s,a).
+    """
+    V_estimate = {}
+    Q_estimate = {}
+    num_states = mdp.num_states
+    num_actions = mdp.num_actions
+
+    st.write(f"Estimating V(s) using {num_episodes_per} episodes per state...")
+    v_progress = st.progress(0)
+    # --- Estimate V(s) ---
+    for s_idx_start in range(num_states):
+        start_state_name = mdp.idx_to_state[s_idx_start]
+        episode_returns = []
+        for _ in range(num_episodes_per):
+            # Simulate one episode starting from s_idx_start, following policy pi
+            current_s_idx = s_idx_start
+            G = 0.0
+            discount = 1.0
+            for step in range(max_steps):
+                action_idx = policy_func(current_s_idx, mdp)
+                # Get reward R(s,a)
+                reward = mdp.R[action_idx, current_s_idx]
+                G += discount * reward
+                discount *= gamma
+
+                # Get next state
+                next_state_probs = mdp.P[action_idx, current_s_idx, :]
+                if np.sum(next_state_probs) > 0:
+                    current_s_idx = np.random.choice(mdp.num_states, p=next_state_probs)
+                else:
+                    # Stay in same state if no transitions defined (shouldn't happen here)
+                    pass  # G already includes reward for the action from current_s_idx
+            episode_returns.append(G)
+
+        V_estimate[start_state_name] = (
+            np.mean(episode_returns) if episode_returns else 0.0
+        )
+        v_progress.progress((s_idx_start + 1) / num_states)
+    v_progress.empty()
+
+    st.write(f"Estimating Q(s,a) using {num_episodes_per} episodes per state-action...")
+    q_progress = st.progress(0)
+    # --- Estimate Q(s,a) ---
+    total_sa_pairs = num_states * num_actions
+    count_sa = 0
+    for s_idx_start in range(num_states):
+        start_state_name = mdp.idx_to_state[s_idx_start]
+        for a_idx_start in range(num_actions):
+            start_action_name = mdp.actions[a_idx_start]
+            episode_returns = []
+            for _ in range(num_episodes_per):
+                # Simulate one episode starting in s, taking action a, then following pi
+                current_s_idx = s_idx_start
+                action_idx = a_idx_start  # Force first action
+                G = 0.0
+                discount = 1.0
+
+                # Step 0: Take forced action a_idx_start
+                reward = mdp.R[action_idx, current_s_idx]  # R(s0, a0)
+                G += discount * reward
+                discount *= gamma
+
+                next_state_probs = mdp.P[action_idx, current_s_idx, :]
+                if np.sum(next_state_probs) > 0:
+                    current_s_idx = np.random.choice(
+                        mdp.num_states, p=next_state_probs
+                    )  # Now in s1
+                else:
+                    current_s_idx = (
+                        current_s_idx  # Stay in s0, loop below will start from here
+                    )
+
+                # Step 1 to T-1: Follow policy pi
+                for step in range(1, max_steps):  # T-1 steps following policy
+                    action_idx = policy_func(current_s_idx, mdp)
+                    reward = mdp.R[action_idx, current_s_idx]
+                    G += discount * reward
+                    discount *= gamma
+
+                    next_state_probs = mdp.P[action_idx, current_s_idx, :]
+                    if np.sum(next_state_probs) > 0:
+                        current_s_idx = np.random.choice(
+                            mdp.num_states, p=next_state_probs
+                        )
+                    else:
+                        pass
+                episode_returns.append(G)
+
+            Q_estimate[(start_state_name, start_action_name)] = (
+                np.mean(episode_returns) if episode_returns else 0.0
+            )
+            count_sa += 1
+            q_progress.progress(count_sa / total_sa_pairs)
+    q_progress.empty()
+
+    return V_estimate, Q_estimate
+
+
+# --- Function to Calculate Ground Truth V_pi using Matrix Inversion ---
+def calculate_ground_truth_V(mdp, policy_func, gamma):
+    """Calculates the exact state value function V_pi(s) using matrix inversion.
+
+    Args:
+        mdp: The RichFamousMDP instance.
+        policy_func: The policy function (deterministic: state_idx -> action_idx).
+        gamma: Discount factor.
+
+    Returns:
+        V_truth: Dictionary mapping state_name -> exact value V_pi(s).
+    """
+    num_states = mdp.num_states
+    num_actions = mdp.num_actions
+    P_orig = mdp.get_transitions()  # P[action, state, next_state]
+    R_all = mdp.get_rewards()  # R[action, state]
+
+    # Initialize P_pi and R_pi
+    P_pi = np.zeros((num_states, num_states))
+    R_pi = np.zeros(num_states)
+
+    # --- Calculate P_pi and R_pi based on policy type ---
+    # Check if it's the random policy (needs special handling)
+    # Note: This is a bit fragile. A better approach might involve
+    # the policy function returning probabilities pi(a|s) instead of just an action index.
+    is_random_policy = policy_func == policy_random
+
+    for s_idx in range(num_states):
+        if is_random_policy:
+            # Stochastic policy: Average over actions
+            action_prob = 1.0 / num_actions  # Assume uniform random
+            expected_reward = 0.0
+            expected_transitions = np.zeros(num_states)
+            for a_idx in range(num_actions):
+                expected_reward += action_prob * R_all[a_idx, s_idx]
+                expected_transitions += action_prob * P_orig[a_idx, s_idx, :]
+            R_pi[s_idx] = expected_reward
+            P_pi[s_idx, :] = expected_transitions
+        else:
+            # Deterministic policy: Use the single chosen action
+            action_idx = policy_func(s_idx, mdp)
+            R_pi[s_idx] = R_all[action_idx, s_idx]
+            P_pi[s_idx, :] = P_orig[action_idx, s_idx, :]
+
+    # 3. Solve the Bellman equation: V = R_pi + gamma * P_pi * V
+    # => (I - gamma * P_pi) * V = R_pi
+    # => V = inv(I - gamma * P_pi) * R_pi
+    try:
+        I = np.identity(num_states)
+        inv_matrix = np.linalg.inv(I - gamma * P_pi)
+        V_vector = inv_matrix @ R_pi
+
+        # Map results back to state names
+        V_truth = {
+            mdp.idx_to_state[s_idx]: V_vector[s_idx] for s_idx in range(num_states)
+        }
+        return V_truth
+
+    except np.linalg.LinAlgError:
+        st.error(
+            "Could not compute ground truth V(s): Matrix (I - gamma*P_pi) is singular."
+        )
+        return None
+
+
 # --- Instantiate MDP early ---
 # Create the MDP instance here so it's available for both tabs
 mdp = RichFamousMDP()
@@ -357,7 +544,13 @@ st.title("Markov Process and MDP Simulation")
 # --- Main Area with Tabs ---
 # No sidebar, controls are inside tabs now.
 
-tab1, tab2 = st.tabs(["Simple Random Walk (Markov Process)", "Rich/Famous MDP Example"])
+tab1, tab2, tab3 = st.tabs(
+    [
+        "Simple Random Walk (Markov Process)",
+        "Rich/Famous MDP Example",
+        "MC Value Estimation",
+    ]
+)
 
 # --- Tab 1: Markov Process ---
 with tab1:
@@ -865,12 +1058,15 @@ with tab2:
 
         st.subheader("Run Single Simulation (Under Selected Policy)")
         if st.button("Run Single MDP Simulation", key="run_single_mdp_button"):
-            traj_states, traj_rewards, total_reward = simulate_mdp_trajectory(
-                mdp, policy_func, start_state_mdp, n_steps_mdp
+            traj_states, traj_actions, traj_rewards, total_reward = (
+                simulate_mdp_trajectory(mdp, policy_func, start_state_mdp, n_steps_mdp)
             )
             if traj_states:
                 st.session_state.mdp_single_trajectory_states = [
                     mdp.idx_to_state[s] for s in traj_states
+                ]
+                st.session_state.mdp_single_trajectory_actions = [
+                    mdp.actions[a] for a in traj_actions
                 ]
                 st.session_state.mdp_single_trajectory_rewards = traj_rewards
                 st.session_state.mdp_single_total_reward = total_reward
@@ -913,8 +1109,10 @@ with tab2:
             states_at_time_mdp = {t: [] for t in time_milestones_mdp}
 
             for i in range(num_simulations_mdp):
-                traj_states, _, total_reward = simulate_mdp_trajectory(
-                    mdp, policy_func, start_state_mdp, n_steps_mdp
+                traj_states, traj_actions, traj_rewards, total_reward = (
+                    simulate_mdp_trajectory(
+                        mdp, policy_func, start_state_mdp, n_steps_mdp
+                    )
                 )
                 if traj_states:
                     final_state_name = mdp.idx_to_state[traj_states[-1]]
@@ -936,6 +1134,7 @@ with tab2:
             )
             # Clear conflicting results
             st.session_state.pop("mdp_single_trajectory_states", None)
+            st.session_state.pop("mdp_single_trajectory_actions", None)
             st.session_state.pop("mdp_single_trajectory_rewards", None)
             st.session_state.pop("mdp_single_total_reward", None)
 
@@ -1028,7 +1227,7 @@ with tab2:
                     policy_to_run = mdp_policies[policy_name]
                     policy_rewards = []
                     for _ in range(num_compare_sims):
-                        _, _, total_reward = simulate_mdp_trajectory(
+                        _, _, _, total_reward = simulate_mdp_trajectory(
                             mdp, policy_to_run, start_state_compare, n_steps_compare
                         )
                         if total_reward is not None:
@@ -1053,5 +1252,114 @@ with tab2:
                     sorted_comparison, columns=["Policy", "Average Total Reward"]
                 )
                 st.dataframe(df_comparison.round(3))
+
+# --- Tab 3: Monte Carlo Value Estimation ---
+with tab3:
+    st.header("Monte Carlo Policy Evaluation")
+    st.write(
+        "Estimate the state value function (V) and state-action value function (Q) "
+        "for a given policy using First-Visit Monte Carlo prediction."
+    )
+    st.caption(f"Evaluation always starts episodes from state: 'poor, unknown'")
+
+    # Layout: Controls on Left (width 1), Output on Right (width 3)
+    col3_controls, col3_output = st.columns([1, 3])
+
+    # --- Controls Column (Tab 3) ---
+    with col3_controls:
+        with st.container(height=700):
+            st.subheader("Evaluation Settings")
+
+            mc_policy_name = st.selectbox(
+                "Select Policy to Evaluate",
+                list(mdp_policies.keys()),
+                key="mc_policy_select",
+            )
+            mc_gamma = st.slider(
+                "Discount Factor (γ)", 0.0, 1.0, 0.9, 0.05, key="mc_gamma"
+            )
+            mc_num_episodes = st.slider(
+                "Number of Episodes (N)", 100, 10000, 1000, 100, key="mc_num_episodes"
+            )
+            mc_max_steps = st.slider(
+                "Max Steps per Episode (T)", 10, 200, 50, 10, key="mc_max_steps"
+            )
+
+    # --- Output Column (Tab 3) ---
+    with col3_output:
+        st.subheader("Evaluation Results")
+
+        # Display selected settings
+        st.write(f"**Policy:** {mc_policy_name}")
+        st.write(f"**Gamma (γ):** {mc_gamma}")
+        st.write(f"**Num Episodes (N):** {mc_num_episodes}")
+        st.write(f"**Max Steps (T):** {mc_max_steps}")
+
+        if st.button("Run Monte Carlo Evaluation", key="run_mc_eval_button"):
+            policy_to_eval = mdp_policies[mc_policy_name]
+            with st.spinner(
+                f"Running {mc_num_episodes} episodes (max {mc_max_steps} steps each)..."
+            ):
+                V_est, Q_est = monte_carlo_specific_start_evaluation(
+                    mdp, policy_to_eval, mc_gamma, mc_num_episodes, mc_max_steps
+                )
+                st.session_state.mc_V_estimate = V_est
+                st.session_state.mc_Q_estimate = Q_est
+                st.success("Monte Carlo evaluation complete.")
+
+        if "mc_V_estimate" in st.session_state and "mc_Q_estimate" in st.session_state:
+            st.markdown("--- ")
+            st.markdown("**Estimated State Value Function V(s):**")
+            V_df = pd.Series(st.session_state.mc_V_estimate).reset_index()
+            V_df.columns = ["State", "Estimated Value"]
+            st.dataframe(V_df.round(4))
+
+            st.markdown("**Estimated State-Action Value Function Q(s,a):**")
+            # Convert Q dict keys (tuples) to multi-index for display
+            Q_series = pd.Series(st.session_state.mc_Q_estimate)
+            Q_series.index = pd.MultiIndex.from_tuples(
+                Q_series.index, names=["State", "Action"]
+            )
+            # Unstack to get actions as columns
+            Q_df = Q_series.unstack(level=-1)
+            # Reorder columns to match MDP definition
+            Q_df = Q_df[mdp.actions]
+            st.dataframe(Q_df.round(4))
+            st.caption(
+                "Note: Values of 0.0 might indicate the state or state-action pair was never visited in the simulation runs."
+            )
+
+            st.markdown("--- ")
+            st.markdown("**Comparison with Ground Truth V(s):**")
+
+            # Calculate ground truth using current settings
+            policy_to_eval_truth = mdp_policies[mc_policy_name]
+            V_truth_dict = calculate_ground_truth_V(mdp, policy_to_eval_truth, mc_gamma)
+
+            if V_truth_dict:
+                st.markdown(
+                    "**Ground Truth State Value Function V(s) (via Matrix Inversion):**"
+                )
+                V_truth_df = pd.Series(V_truth_dict).reset_index()
+                V_truth_df.columns = ["State", "Ground Truth Value"]
+                st.dataframe(V_truth_df.round(4))
+
+                # Prepare comparison dataframe
+                mc_V_series = pd.Series(
+                    st.session_state.mc_V_estimate, name="MC Estimate"
+                )
+                truth_V_series = pd.Series(V_truth_dict, name="Ground Truth")
+
+                comparison_df = pd.concat([mc_V_series, truth_V_series], axis=1)
+                comparison_df["Absolute Error"] = (
+                    comparison_df["MC Estimate"] - comparison_df["Ground Truth"]
+                ).abs()
+                comparison_df.index.name = "State"
+
+                st.markdown("**Monte Carlo vs. Ground Truth Comparison:**")
+                st.dataframe(comparison_df.round(4))
+            else:
+                st.warning("Ground truth calculation failed, comparison not available.")
+
 
 # Cleaned up old logic previously - Removed sidebar and default value logic
