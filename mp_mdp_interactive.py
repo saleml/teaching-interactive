@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, PillowWriter
 import time
 import pandas as pd
+from scipy.special import comb
 
 
 class LineEnvironment:
@@ -617,6 +618,135 @@ with tab1:
             with col3:
                 st.metric("Walks Run (N)", num_walks_run)
 
+            st.markdown("--- ")
+
+            st.subheader(
+                "Comparison: Empirical vs. Theoretical State Distributions (Time-Homogeneous Only)"
+            )
+
+            if "batch_states_at_time" in st.session_state:
+                states_at_time_data_mp = st.session_state.batch_states_at_time
+                selected_start_state_line = start_state_line
+                is_homogeneous_for_calc = is_homogeneous_line
+                p_left_for_calc = p_left_initial
+
+                if not is_homogeneous_for_calc:
+                    st.info(
+                        "Theoretical distribution comparison is only available for time-homogeneous processes."
+                    )
+                else:
+                    times_to_compare_mp = sorted(
+                        [t for t in states_at_time_data_mp.keys() if t > 0]
+                    )
+
+                    if not times_to_compare_mp:
+                        st.write(
+                            "No time steps (t>0) available from batch simulation for comparison."
+                        )
+                    else:
+                        num_runs_comparison_mp = len(
+                            st.session_state.get("batch_final_states", [])
+                        )
+                        st.write(
+                            f"Comparing empirical distribution (from {num_runs_comparison_mp} runs) vs. theoretical distribution (Binomial)."
+                        )
+                        st.write(
+                            f"Theoretical calculation uses **current settings**: Start State={selected_start_state_line}, p_left={p_left_for_calc:.2f}."
+                        )
+
+                        n_cols_mp = min(len(times_to_compare_mp), 3)
+                        plot_cols_mp = st.columns(n_cols_mp)
+                        col_idx_mp = 0
+
+                        for t in times_to_compare_mp:
+                            empirical_states_mp = states_at_time_data_mp.get(t, [])
+                            if not empirical_states_mp:
+                                continue
+
+                            empirical_counts_mp = pd.Series(
+                                empirical_states_mp
+                            ).value_counts()
+                            empirical_freq_mp = empirical_counts_mp / len(
+                                empirical_states_mp
+                            )
+
+                            possible_states_t = np.arange(
+                                selected_start_state_line - t,
+                                selected_start_state_line + t + 1,
+                                2,
+                            )
+                            theoretical_probs = {}
+                            p_right = 1.0 - p_left_for_calc
+                            for s in possible_states_t:
+                                diff = s - selected_start_state_line
+                                if (t + diff) % 2 == 0:
+                                    k_right = (t + diff) // 2
+                                    if 0 <= k_right <= t:
+                                        prob = (
+                                            comb(t, k_right)
+                                            * (p_right**k_right)
+                                            * (p_left_for_calc ** (t - k_right))
+                                        )
+                                        theoretical_probs[s] = prob
+
+                            theoretical_series = pd.Series(
+                                theoretical_probs
+                            ).sort_index()
+
+                            all_states = sorted(
+                                list(
+                                    set(empirical_freq_mp.index)
+                                    | set(theoretical_series.index)
+                                )
+                            )
+                            empirical_freq_aligned = empirical_freq_mp.reindex(
+                                all_states, fill_value=0
+                            )
+                            theoretical_prob_aligned = theoretical_series.reindex(
+                                all_states, fill_value=0
+                            )
+
+                            with plot_cols_mp[col_idx_mp % n_cols_mp]:
+                                fig_comp_mp, ax_comp_mp = plt.subplots(
+                                    figsize=(max(5, len(all_states) * 0.6), 3.5)
+                                )
+
+                                bar_width_mp = 0.35
+                                index_mp = np.arange(len(all_states))
+
+                                rects1_mp = ax_comp_mp.bar(
+                                    index_mp - bar_width_mp / 2,
+                                    empirical_freq_aligned.values,
+                                    bar_width_mp,
+                                    label="Empirical",
+                                    alpha=0.75,
+                                    color="skyblue",
+                                )
+                                rects2_mp = ax_comp_mp.bar(
+                                    index_mp + bar_width_mp / 2,
+                                    theoretical_prob_aligned.values,
+                                    bar_width_mp,
+                                    label="Theoretical",
+                                    alpha=0.75,
+                                    color="salmon",
+                                )
+
+                                ax_comp_mp.set_ylabel("Frequency / Probability")
+                                ax_comp_mp.set_title(f"Distribution at t={t}")
+                                ax_comp_mp.set_xticks(index_mp)
+                                ax_comp_mp.set_xticklabels(all_states)
+                                ax_comp_mp.legend(fontsize="small")
+                                ax_comp_mp.set_ylim(bottom=0)
+                                plt.tight_layout()
+                                st.pyplot(fig_comp_mp)
+                                plt.close(fig_comp_mp)
+
+                            col_idx_mp += 1
+            else:
+                st.write(
+                    "Run 'N Walks' first to generate empirical data for comparison."
+                )
+
 # --- Tab 2: MDP Implementation (Policy Simulation) ---
 with tab2:
     # Layout: Controls on Left (width 1), Output on Right (width 3)
@@ -875,52 +1005,52 @@ with tab2:
             else:
                 st.write("(No time distribution data)")
 
-        st.markdown("--- ")
-        st.subheader("Compare Average Rewards Across Policies")
-        st.write(
-            "Run batch simulations for all defined policies starting from 'poor, unknown' to compare their average performance."
-        )
-
-        start_state_compare = "poor, unknown"
-        st.write(
-            f"Comparison Settings: N={num_compare_sims}, T={n_steps_compare}, Start State='{start_state_compare}'"
-        )
-
-        if st.button("Run Policy Comparison", key="run_policy_compare_button"):
+            st.markdown("--- ")
+            st.subheader("Compare Average Rewards Across Policies")
             st.write(
-                f"Comparing policies over {num_compare_sims} runs of {n_steps_compare} steps each, starting from '{start_state_compare}'..."
+                "Run batch simulations for all defined policies starting from 'poor, unknown' to compare their average performance."
             )
-            policy_comparison_results = {}
-            comparison_progress = st.progress(0)
-            policy_names = list(mdp_policies.keys())
-            for i, policy_name in enumerate(policy_names):
-                policy_to_run = mdp_policies[policy_name]
-                policy_rewards = []
-                for _ in range(num_compare_sims):
-                    _, _, total_reward = simulate_mdp_trajectory(
-                        mdp, policy_to_run, start_state_compare, n_steps_compare
-                    )
-                    if total_reward is not None:
-                        policy_rewards.append(total_reward)
-                policy_comparison_results[policy_name] = (
-                    np.mean(policy_rewards) if policy_rewards else None
-                )
-                comparison_progress.progress((i + 1) / len(policy_names))
-            st.success("Policy comparison complete!")
-            comparison_progress.empty()
-            st.session_state.policy_comparison_results = policy_comparison_results
 
-        if "policy_comparison_results" in st.session_state:
-            st.markdown("**Average Total Reward Comparison:**")
-            comparison_data = st.session_state.policy_comparison_results
-            sorted_comparison = sorted(
-                comparison_data.items(),
-                key=lambda item: item[1] if item[1] is not None else -np.inf,
-                reverse=True,
+            start_state_compare = "poor, unknown"
+            st.write(
+                f"Comparison Settings: N={num_compare_sims}, T={n_steps_compare}, Start State='{start_state_compare}'"
             )
-            df_comparison = pd.DataFrame(
-                sorted_comparison, columns=["Policy", "Average Total Reward"]
-            )
-            st.dataframe(df_comparison.round(3))
+
+            if st.button("Run Policy Comparison", key="run_policy_compare_button"):
+                st.write(
+                    f"Comparing policies over {num_compare_sims} runs of {n_steps_compare} steps each, starting from '{start_state_compare}'..."
+                )
+                policy_comparison_results = {}
+                comparison_progress = st.progress(0)
+                policy_names = list(mdp_policies.keys())
+                for i, policy_name in enumerate(policy_names):
+                    policy_to_run = mdp_policies[policy_name]
+                    policy_rewards = []
+                    for _ in range(num_compare_sims):
+                        _, _, total_reward = simulate_mdp_trajectory(
+                            mdp, policy_to_run, start_state_compare, n_steps_compare
+                        )
+                        if total_reward is not None:
+                            policy_rewards.append(total_reward)
+                    policy_comparison_results[policy_name] = (
+                        np.mean(policy_rewards) if policy_rewards else None
+                    )
+                    comparison_progress.progress((i + 1) / len(policy_names))
+                st.success("Policy comparison complete!")
+                comparison_progress.empty()
+                st.session_state.policy_comparison_results = policy_comparison_results
+
+            if "policy_comparison_results" in st.session_state:
+                st.markdown("**Average Total Reward Comparison:**")
+                comparison_data = st.session_state.policy_comparison_results
+                sorted_comparison = sorted(
+                    comparison_data.items(),
+                    key=lambda item: item[1] if item[1] is not None else -np.inf,
+                    reverse=True,
+                )
+                df_comparison = pd.DataFrame(
+                    sorted_comparison, columns=["Policy", "Average Total Reward"]
+                )
+                st.dataframe(df_comparison.round(3))
 
 # Cleaned up old logic previously - Removed sidebar and default value logic
