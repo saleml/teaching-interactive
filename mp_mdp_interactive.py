@@ -706,10 +706,9 @@ with tab1:
                                 all_states, fill_value=0
                             )
 
+                            # Plot comparison for time t
                             with plot_cols_mp[col_idx_mp % n_cols_mp]:
-                                fig_comp_mp, ax_comp_mp = plt.subplots(
-                                    figsize=(max(5, len(all_states) * 0.6), 3.5)
-                                )
+                                fig_comp_mp, ax_comp_mp = plt.subplots(figsize=(7, 4))
 
                                 bar_width_mp = 0.35
                                 index_mp = np.arange(len(all_states))
@@ -734,7 +733,9 @@ with tab1:
                                 ax_comp_mp.set_ylabel("Frequency / Probability")
                                 ax_comp_mp.set_title(f"Distribution at t={t}")
                                 ax_comp_mp.set_xticks(index_mp)
-                                ax_comp_mp.set_xticklabels(all_states)
+                                ax_comp_mp.set_xticklabels(
+                                    all_states, rotation=45, ha="right"
+                                )
                                 ax_comp_mp.legend(fontsize="small")
                                 ax_comp_mp.set_ylim(bottom=0)
                                 plt.tight_layout()
